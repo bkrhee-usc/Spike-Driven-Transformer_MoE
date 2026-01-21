@@ -17,7 +17,7 @@ class Erode(nn.Module):
         return self.pool(x)
 
 
-class MS_MLP_Conv(nn.Module):
+class MS_MLP_Expert(nn.Module):
     def __init__(
         self,
         in_features,
@@ -26,6 +26,7 @@ class MS_MLP_Conv(nn.Module):
         drop=0.0,
         spike_mode="lif",
         layer=0,
+        tau=2.0
     ):
         super().__init__()
         out_features = out_features or in_features
@@ -34,10 +35,10 @@ class MS_MLP_Conv(nn.Module):
         self.fc1_conv = nn.Conv2d(in_features, hidden_features, kernel_size=1, stride=1)
         self.fc1_bn = nn.BatchNorm2d(hidden_features)
         if spike_mode == "lif":
-            self.fc1_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend="cupy")
+            self.fc1_lif = MultiStepLIFNode(tau=tau, detach_reset=True, backend="cupy")
         elif spike_mode == "plif":
             self.fc1_lif = MultiStepParametricLIFNode(
-                init_tau=2.0, detach_reset=True, backend="cupy"
+                init_tau=tau, detach_reset=True, backend="cupy"
             )
 
         self.fc2_conv = nn.Conv2d(
@@ -54,6 +55,12 @@ class MS_MLP_Conv(nn.Module):
         self.c_hidden = hidden_features
         self.c_output = out_features
         self.layer = layer
+        
+    def reset(self):
+        """Reset LIF neuron states"""
+        for m in self.modules():
+            if hasattr(m, "reset"):
+                m.reset()
 
     def forward(self, x, hook=None):
         T, B, C, H, W = x.shape
@@ -476,12 +483,13 @@ class MS_Block_Conv(nn.Module):
         attn_drop=0.0,  # Kept for signature compatibility
         drop_path=0.0,  # Kept for signature compatibility
         sr_ratio=1,     # Kept for signature compatibility
+        norm_layer=nn.LayerNorm,
         attn_mode="direct_xor",
         spike_mode="lif",
         dvs=False,
         layer=0,
-        attention_mode="STAtten",
-        chunk_size=2,
+        # attention_mode="STAtten",
+        # chunk_size=2,
         # MoE parameters
         num_experts=8,
         expert_top_k=2,
@@ -495,8 +503,8 @@ class MS_Block_Conv(nn.Module):
             mode=attn_mode,
             dvs=dvs,
             layer=layer,
-            attention_mode=attention_mode,
-            chunk_size=chunk_size
+            # attention_mode=attention_mode,
+            # chunk_size=chunk_size
         )
         # Removed unused self.drop_path definition
         

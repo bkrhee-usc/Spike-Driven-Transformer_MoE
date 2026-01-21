@@ -41,6 +41,7 @@ class SpikeDrivenTransformer(nn.Module):
         cml=False,
         pretrained=False,
         pretrained_cfg=None,
+        # chunk_size=2,
         # MoE Specific Parameters
         use_moe=True,        # Kept for compatibility
         num_experts=8,       # Number of experts per block
@@ -86,7 +87,7 @@ class SpikeDrivenTransformer(nn.Module):
                     spike_mode=spike_mode,
                     dvs=dvs_mode,
                     layer=j,
-                    chunk_size=chunk_size,
+                    # chunk_size=chunk_size,
                     # Pass MoE params down to the block
                     use_moe=use_moe,
                     num_experts=num_experts,
