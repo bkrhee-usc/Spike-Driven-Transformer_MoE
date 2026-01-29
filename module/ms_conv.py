@@ -1,9 +1,64 @@
+import torch
 import torch.nn as nn
 from timm.models.layers import DropPath
 from spikingjelly.clock_driven.neuron import (
     MultiStepLIFNode,
     MultiStepParametricLIFNode,
 )
+
+import torch.nn.functional as F
+import math
+from inspect import isfunction
+
+# codes adopted from https://github.com/lucidrains/mixture-of-experts/blob/master/mixture_of_experts/mixture_of_experts.py
+
+# constants
+
+MIN_EXPERT_CAPACITY = 4
+
+# helper functions
+
+def default(val, default_val):
+    default_val = default_val() if isfunction(default_val) else default_val
+    return val if val is not None else default_val
+
+def cast_tuple(el):
+    return el if isinstance(el, tuple) else (el,)
+
+# tensor related helper functions
+
+def top1(t):
+    values, index = t.topk(k=1, dim=-1)
+    values, index = map(lambda x: x.squeeze(dim=-1), (values, index))
+    return values, index
+
+def cumsum_exclusive(t, dim=-1):
+    num_dims = len(t.shape)
+    num_pad_dims = - dim - 1
+    pre_padding = (0, 0) * num_pad_dims
+    pre_slice   = (slice(None),) * num_pad_dims
+    padded_t = F.pad(t, (*pre_padding, 1, 0)).cumsum(dim=dim)
+    return padded_t[(..., slice(None, -1), *pre_slice)]
+
+# pytorch one hot throws an error if there are out of bound indices.
+# tensorflow, in contrast, does not throw an error
+def safe_one_hot(indexes, max_length):
+    max_index = indexes.max() + 1
+    return F.one_hot(indexes, max(max_index + 1, max_length))[..., :max_length]
+
+def init_(t):
+    dim = t.shape[-1]
+    std = 1 / math.sqrt(dim)
+    return t.uniform_(-std, std)
+
+# activations
+
+class GELU_(nn.Module):
+    def forward(self, x):
+        return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
+
+GELU = nn.GELU if hasattr(nn, 'GELU') else GELU_
+
 
 
 class Erode(nn.Module):
@@ -57,8 +112,9 @@ class MS_MLP_Expert(nn.Module):
         self.layer = layer
         
     def reset(self):
-        """Reset LIF neuron states"""
         for m in self.modules():
+            if m is self:
+                continue
             if hasattr(m, "reset"):
                 m.reset()
 
@@ -80,7 +136,7 @@ class MS_MLP_Expert(nn.Module):
         x = self.fc2_conv(x.flatten(0, 1))
         x = self.fc2_bn(x).reshape(T, B, C, H, W).contiguous()
 
-        x = x + identity
+        # x = x + identity
         return x, hook
 
 
@@ -251,285 +307,334 @@ class MS_SSA_Conv(nn.Module):
         return x, v, hook
 
 
-# class MS_Block_Conv(nn.Module):
-#     def __init__(
-#         self,
-#         dim,
-#         num_heads,
-#         mlp_ratio=4.0,
-#         qkv_bias=False,
-#         qk_scale=None,
-#         drop=0.0,
-#         attn_drop=0.0,
-#         drop_path=0.0,
-#         norm_layer=nn.LayerNorm,
-#         sr_ratio=1,
-#         attn_mode="direct_xor",
-#         spike_mode="lif",
-#         dvs=False,
-#         layer=0,
-#     ):
-#         super().__init__()
-#         self.attn = MS_SSA_Conv(
-#             dim,
-#             num_heads=num_heads,
-#             qkv_bias=qkv_bias,
-#             qk_scale=qk_scale,
-#             attn_drop=attn_drop,
-#             proj_drop=drop,
-#             sr_ratio=sr_ratio,
-#             mode=attn_mode,
-#             spike_mode=spike_mode,
-#             dvs=dvs,
-#             layer=layer,
-#         )
-#         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-#         mlp_hidden_dim = int(dim * mlp_ratio)
-#         self.mlp = MS_MLP_Conv(
-#             in_features=dim,
-#             hidden_features=mlp_hidden_dim,
-#             drop=drop,
-#             spike_mode=spike_mode,
-#             layer=layer,
-#         )
 
-#     def forward(self, x, hook=None):
-#         x_attn, attn, hook = self.attn(x, hook=hook)
-#         x, hook = self.mlp(x_attn, hook=hook)
-#         return x, attn, hook
-
-
-class SpikeRouter(nn.Module):
-    """Spike-based router for expert selection"""
+## The gating should select expert per batch in order to run MS_MLP_Expert that receives a shape of T, B, C, H, W
+class Top2Gating(nn.Module):
     def __init__(
         self,
-        in_features,
-        num_experts,
-        top_k=2,
-        spike_mode="lif",
-    ):
+        dim,
+        num_gates,
+        eps = 1e-9,
+        ##
+        top_k = 1,
+        outer_expert_dims = tuple(),
+        second_policy_train = 'random',
+        second_policy_eval = 'random',
+        second_threshold_train = 0.2,
+        second_threshold_eval = 0.2,
+        capacity_factor_train = 4.,
+        capacity_factor_eval = 4.
+        #capacity_factor_train = 1.25,
+        #capacity_factor_eval = 2.
+        ):
         super().__init__()
-        self.num_experts = num_experts
-        self.top_k = top_k
-        
-        # Router network
-        self.router_conv = nn.Conv2d(in_features, num_experts, kernel_size=1, stride=1)
-        self.router_bn = nn.BatchNorm2d(num_experts)
-        
-        if spike_mode == "lif":
-            self.router_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend="cupy")
-        elif spike_mode == "plif":
-            self.router_lif = MultiStepParametricLIFNode(init_tau=2.0, detach_reset=True, backend="cupy")
 
-    def forward(self, x):
-        """
-        Returns:
-            routing_weights: Softmax probabilities (T*B, num_experts)
-            selected_experts: Top-k expert indices (T*B, top_k)
-            router_logits: Raw router outputs (T*B, num_experts)
-        """
-        T, B, C, H, W = x.shape
-        
-        # Generate routing logits through spike network
-        router_out = self.router_lif(x)
-        router_out = self.router_conv(router_out.flatten(0, 1))
-        router_out = self.router_bn(router_out).reshape(T, B, self.num_experts, H, W)
-        
-        # Global average pooling over spatial dimensions for routing decision
-        router_logits = router_out.mean(dim=[-2, -1])
-        
-        # Flatten temporal and batch dimensions
-        router_logits = router_logits.reshape(T * B, self.num_experts)
-        
-        # Apply softmax to get routing probabilities
-        routing_weights = F.softmax(router_logits, dim=-1)
-        
-        # Select top-k experts
-        top_k_weights, top_k_indices = torch.topk(routing_weights, self.top_k, dim=-1)
-        
-        # Renormalize top-k weights
-        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
-        
-        return top_k_weights, top_k_indices, router_logits
-    
+        self.eps = eps
+        self.num_gates = num_gates
+        self.top_k = top_k  
+        # self.w_gating = nn.Parameter(torch.randn(*outer_expert_dims, dim, num_gates))
+        self.w_gating = nn.Parameter(torch.randn(dim, num_gates))
 
-class MS_MoE_Conv(nn.Module):
-    """
-    Sparse Mixture of Experts for SNN - 🚀 VECTORIZED FAST VERSION 🚀
-    """
-    def __init__(
-        self,
-        in_features,
+        self.second_policy_train = second_policy_train
+        self.second_policy_eval = second_policy_eval
+        self.second_threshold_train = second_threshold_train
+        self.second_threshold_eval = second_threshold_eval
+        self.capacity_factor_train = capacity_factor_train
+        self.capacity_factor_eval = capacity_factor_eval
+
+
+        # for checking distribution
+        self.last_indices = None
+        self.last_masks = None
+        self.last_gates = None
+        self.last_raw_gates = None
+
+    def forward(self, x, importance=None):
+        T, B, dim, H, W = x.shape
+        group_size = H * W
+        num_gates = self.num_gates
+
+        if self.training:
+            policy = self.second_policy_train
+            threshold = self.second_threshold_train
+            capacity_factor = self.capacity_factor_train
+        else:
+            policy = self.second_policy_eval
+            threshold = self.second_threshold_eval
+            capacity_factor = self.capacity_factor_eval
+
+        # Pool over time
+        x_tok = x.flatten(3).permute(0, 1, 3, 2).contiguous()  # T, B, N, C
+        x_pooled = x_tok.mean(dim=0)  # B, N, C
+
+        raw_gates = torch.einsum('bnd,de->bne', x_pooled, self.w_gating)
+        raw_gates = raw_gates.softmax(dim=-1)
+
+        # Store masks, gates, indices, and positions for all top-k
+        masks = []
+        gates = []
+        indices = []
+        positions = []
+        
+        gates_remaining = raw_gates.clone()
+        cumulative_mask_count = torch.zeros(B, 1, num_gates).to(raw_gates.device)  # Track capacity usage
+        
+        # Find top-k experts iteratively
+        for k in range(self.top_k):
+            gate_k, index_k = top1(gates_remaining)  # B, N
+            mask_k = F.one_hot(index_k, num_gates).float()  # B, N, E
+            
+            # Apply importance filtering -- however, not used currently
+            if importance is not None:
+                if k == 0:
+                    # First expert: only importance == 1
+                    importance_mask = (importance == 1.).float()
+                else:
+                    # Other experts: importance > 0
+                    importance_mask = (importance > 0.).float()
+                
+                mask_k *= importance_mask[..., None]
+                gate_k *= importance_mask
+            
+            # Compute position in expert
+            position_k = cumsum_exclusive(mask_k, dim=-2) + cumulative_mask_count
+            position_k = position_k * mask_k
+            
+            # Update cumulative count
+            cumulative_mask_count = cumulative_mask_count + mask_k.sum(dim=-2, keepdim=True)
+            
+            masks.append(mask_k)
+            gates.append(gate_k)
+            indices.append(index_k)
+            positions.append(position_k.sum(dim=-1))  # B, N
+            
+            # Remove selected expert from remaining gates for next iteration
+            gates_remaining = gates_remaining * (1. - mask_k)
+        
+        # Normalize gates
+        gate_sum = sum(gates) + self.eps
+        gates = [g / gate_sum for g in gates]
+        
+        # Compute balancing loss (using first expert)
+        density_1 = masks[0].mean(dim=-2)
+        density_1_proxy = raw_gates.mean(dim=-2)
+        loss = (density_1_proxy * density_1).mean() * float(num_gates ** 2)
+        
+        # Apply policies to non-first experts
+        for k in range(1, self.top_k):
+            if policy == "all":
+                pass
+            elif policy == "none":
+                masks[k] = torch.zeros_like(masks[k])
+            elif policy == "threshold":
+                masks[k] *= (gates[k] > threshold).float().unsqueeze(-1)
+            elif policy == "random":
+                probs = torch.zeros_like(gates[k]).uniform_(0., 1.)
+                masks[k] *= (probs < (gates[k] / max(threshold, self.eps))).float().unsqueeze(-1)
+        
+        # Compute expert capacity
+        expert_capacity = min(group_size, int((group_size * capacity_factor) / num_gates))
+        expert_capacity = max(expert_capacity, MIN_EXPERT_CAPACITY)
+        expert_capacity_f = float(expert_capacity)
+        
+        # Apply capacity constraints and recompute positions
+        cumulative_position = torch.zeros(B, 1, num_gates).to(raw_gates.device)
+        for k in range(self.top_k):
+            position_k = cumsum_exclusive(masks[k], dim=-2) + cumulative_position
+            position_k = position_k * masks[k]
+            
+            # Apply capacity constraint
+            masks[k] *= (position_k < expert_capacity_f).float()
+            
+            # Update positions and gates based on capacity
+            mask_k_flat = masks[k].sum(dim=-1)
+            positions[k] = position_k.sum(dim=-1)
+            gates[k] *= mask_k_flat
+            
+            # Update cumulative position
+            cumulative_position = cumulative_position + masks[k].sum(dim=-2, keepdim=True)
+        
+        # Build combine and dispatch tensors
+        combine_tensor = torch.zeros(B, group_size, num_gates, expert_capacity).to(raw_gates.device)
+        
+        for k in range(self.top_k):
+            mask_k_flat = masks[k].sum(dim=-1)
+            combine_tensor += (
+                gates[k][..., None, None]
+                * mask_k_flat[..., None, None]
+                * F.one_hot(indices[k], num_gates)[..., None]
+                * safe_one_hot(positions[k].long(), expert_capacity)[..., None, :]
+            )
+        
+        dispatch_tensor = combine_tensor.bool().to(combine_tensor)
+
+        # Cache latest routing info for inspection during inference
+        self.last_indices = indices
+        self.last_masks = masks
+        self.last_gates = gates
+        self.last_raw_gates = raw_gates
+        
+        return dispatch_tensor, combine_tensor, loss
+
+
+
+
+class MoE(nn.Module):
+    def __init__(self,
+        dim,
+        num_experts = 2,
         hidden_features=None,
         out_features=None,
-        num_experts=8,
-        top_k=2,
         spike_mode="lif",
-        layer=0,
-        aux_loss_weight=0.01,
-    ):
+        second_policy_train = 'random',
+        second_policy_eval = 'random',
+        second_threshold_train = 0.2,
+        second_threshold_eval = 0.2,
+        capacity_factor_train = 1.25,
+        capacity_factor_eval = 2.,
+        loss_coef = 1e-2,
+
+        ##
+        top_k = 1,  
+        experts = None):
         super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        
+
         self.num_experts = num_experts
-        self.top_k = top_k
-        self.layer = layer
-        self.aux_loss_weight = aux_loss_weight
+        tau_min = 2
+        tau_max = 2
 
-        tau_min = 1.9
-        tau_max = 2.1
-
-        # Create router
-        self.router = SpikeRouter(
-            in_features=in_features,
-            num_experts=num_experts,
-            top_k=top_k,
-            spike_mode=spike_mode,
-        )
-        
-        # Create expert networks with varying tau values
+        gating_kwargs = {'top_k' : top_k, 'second_policy_train': second_policy_train, 'second_policy_eval': second_policy_eval, 'second_threshold_train': second_threshold_train, 'second_threshold_eval': second_threshold_eval, 'capacity_factor_train': capacity_factor_train, 'capacity_factor_eval': capacity_factor_eval}
+        # gating_kwargs = {'second_policy_train': second_policy_train, 'second_policy_eval': second_policy_eval, 'second_threshold_train': second_threshold_train, 'second_threshold_eval': second_threshold_eval, 'capacity_factor_train': capacity_factor_train, 'capacity_factor_eval': capacity_factor_eval}
+        self.gate = Top2Gating(dim, num_gates = num_experts, **gating_kwargs)
         self.experts = nn.ModuleList([
             MS_MLP_Expert(
-                in_features=in_features,
+                in_features=dim,
                 hidden_features=hidden_features,
                 out_features=out_features,
                 spike_mode=spike_mode,
-                tau=tau_min + i * (tau_max - tau_min) / (num_experts - 1) if num_experts > 1 else tau_min,
+                tau=2.0,
             )
-            for i in range(num_experts) 
+            for i in range(num_experts)
         ])
+        self.loss_coef = loss_coef
+
+    def forward(self, inputs, hook = None, **kwargs):
+        ## steps for MoE
+        ## 1. Gate based on input --> top k is received
+        ## 2. token is made using input : T, B, N, D
+        ## 3. expert_in = token input to each expert
+        ## 4. for each expert, give expert inputs shaped T, B, Ccap, D. These are transformed into T, B, D, 1, Ccap to run MLP_expert(receives T B C H W shape input)
+        #  Then retransformed to T, B, Ccap D
+        ## 5. with the appended expert output, which is the output of each experts, we combine them with combine tensor
+        ## 6. reshape it back to original data shape
+
+        # b, n, d, e = *inputs.shape, self.num_experts
+        T, B, D, H, W = inputs.shape
+        N = H * W
+        E = self.num_experts
+
+        dispatch_tensor, combine_tensor, loss = self.gate(inputs)
+
+        Ccap = combine_tensor.shape[-1]
+
+        ## step 2
+        x_tok = inputs.flatten(3).permute(0, 1, 3, 2).contiguous() # T, B, N, D
+
+        expert_inputs = torch.einsum('tbnd,bnec->tebcd', x_tok, dispatch_tensor.to(x_tok.dtype))
+
+        # Step 4: Process each expert
+        expert_outputs_list = []
         
-        # Removed unused self.c_output
-        self.load_balancing_loss = None
+        for expert_id in range(E):
+            # expert : MLP with channel projection (1x1) --> change input shape from T, B, Ccap, D to T, B, D, 1, Ccap
+            expert_input = expert_inputs[:, expert_id, :, :, :]  # (T, B, Ccap, D)
+
+            expert_input_spatial = expert_input.permute(0, 1, 3, 2) # T, B, D, Ccap
+            expert_input_spatial = expert_input_spatial.unsqueeze(-2) # T, B, D, 1, Ccap
+
+            expert_output_spatial, _ = self.experts[expert_id](expert_input_spatial, hook=hook)
+            expert_output = expert_output_spatial.squeeze(-2)  # (T, B, D, Ccap)
+            expert_output = expert_output.permute(0, 1, 3, 2)  # (T, B, Ccap, D)
+            
+            
+            expert_outputs_list.append(expert_output)
+        
+        # Stack all expert outputs: (E, T, B, Ccap, D) → (T, E, B, Ccap, D)
+        expert_outputs = torch.stack(expert_outputs_list, dim=1)
+        
+        # Step 5: Combine expert outputs using combine_tensor
+        # (T, E, B, Ccap, D) x (B, N, E, Ccap) → (T, B, N, D)
+        output = torch.einsum('tebcd,bnec->tbnd', expert_outputs, combine_tensor)
+        
+        # Reshape back to spatial format: (T, B, N, D) → (T, B, D, H, W)
+        output = output.permute(0, 1, 3, 2).reshape(T, B, D, H, W)
+
+        ###########################################
+        ## add residual connection after experts ##
+        ###########################################
+        output = output + inputs
+
+        return output, loss * self.loss_coef, hook
     
-    def compute_load_balancing_loss(self, router_logits, selected_experts):
-        expert_counts = torch.bincount(
-            selected_experts.view(-1),
-            minlength=self.num_experts
-        ).float()
-        
-        expert_fraction = expert_counts / selected_experts.numel()
-        router_probs = F.softmax(router_logits, dim=-1)
-        router_prob_per_expert = router_probs.mean(dim=0)
-        
-        load_balancing_loss = self.num_experts * (expert_fraction * router_prob_per_expert).sum()
-        return load_balancing_loss
-
-    def forward(self, x, hook=None):
-        T, B, C, H, W = x.shape
-        identity = x
-        
-        # 1. Reset all experts
-        for expert in self.experts:
-            expert.reset()
-        
-        # 2. Get routing decisions
-        top_k_weights, top_k_indices, router_logits = self.router(x)
-
-        # Only detach indices. Keep weights connected for gradient flow.
-        top_k_indices = top_k_indices.detach()
-        
-        if hook is not None:
-            hook[self._get_name() + str(self.layer) + "_routing_weights"] = top_k_weights.detach()
-            hook[self._get_name() + str(self.layer) + "_routing_indices"] = top_k_indices.detach()
-        
-        self.load_balancing_loss = self.compute_load_balancing_loss(router_logits, top_k_indices)
-        
-        # 3. Vectorized Expert Processing
-        x_flat = x.flatten(0, 1)
-        output_flat = torch.zeros_like(x_flat)
-        
-        for expert_idx in range(self.num_experts):
-            indices_for_expert, kth_expert_indices = torch.where(top_k_indices == expert_idx)
-            
-            if indices_for_expert.numel() == 0:
-                continue
-            
-            expert_input_flat = x_flat[indices_for_expert]
-            expert_input = expert_input_flat.unsqueeze(0)
-            
-            expert_output = self.experts[expert_idx](expert_input)
-            expert_output = expert_output.squeeze(0)
-            
-            weights = top_k_weights[indices_for_expert, kth_expert_indices]
-            weights = weights.view(-1, 1, 1, 1)
-            
-            output_flat.index_add_(0, indices_for_expert, expert_output * weights)
-        
-        # 4. Reshape and Residual
-        output = output_flat.view(T, B, C, H, W)
-        output = output + identity
-        
-        if hook is not None:
-            hook[self._get_name() + str(self.layer) + "_moe_output"] = output.detach()
-        
-        return output, hook
-
-
 class MS_Block_Conv(nn.Module):
-    """
-    Unified Transformer Block (Forced MoE Mode)
-    Refactored to remove unused parameters logic while keeping signature compatibility.
-    """
     def __init__(
         self,
         dim,
         num_heads,
         mlp_ratio=4.0,
-        qkv_bias=False, # Kept for signature compatibility
-        qk_scale=None,  # Kept for signature compatibility
-        drop=0.0,       # Kept for signature compatibility
-        attn_drop=0.0,  # Kept for signature compatibility
-        drop_path=0.0,  # Kept for signature compatibility
-        sr_ratio=1,     # Kept for signature compatibility
+        qkv_bias=False,
+        qk_scale=None,
+        drop=0.0,
+        attn_drop=0.0,
+        drop_path=0.0,
         norm_layer=nn.LayerNorm,
+        sr_ratio=1,
         attn_mode="direct_xor",
         spike_mode="lif",
         dvs=False,
         layer=0,
-        # attention_mode="STAtten",
-        # chunk_size=2,
-        # MoE parameters
-        num_experts=8,
-        expert_top_k=2,
-        aux_loss_weight=0.01,
-        use_moe=True, 
+        num_experts = 2,
+        loss_coef=1e-2,
+
+        ##
+        top_k = 1,  
     ):
         super().__init__()
+
         self.attn = MS_SSA_Conv(
             dim,
             num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+            sr_ratio=sr_ratio,
             mode=attn_mode,
+            spike_mode=spike_mode,
             dvs=dvs,
             layer=layer,
-            # attention_mode=attention_mode,
-            # chunk_size=chunk_size
         )
-        # Removed unused self.drop_path definition
-        
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.layer = layer
+
         mlp_hidden_dim = int(dim * mlp_ratio)
-        
-        self.num_experts = num_experts
-        self.aux_loss_weight = aux_loss_weight
-        
-        # Forced MoE
-        self.mlp = MS_MoE_Conv(
-            in_features=dim,
-            hidden_features=mlp_hidden_dim,
+
+        self.mlp = MoE(
+            dim=dim,
             num_experts=num_experts,
-            top_k=expert_top_k,
+            hidden_features=mlp_hidden_dim,
+            out_features=dim,
             spike_mode=spike_mode,
-            layer=layer,
-            aux_loss_weight=aux_loss_weight,
+            loss_coef=loss_coef,
+
+            ##
+            top_k = top_k
         )
+
     def forward(self, x, hook=None):
         x_attn, attn, hook = self.attn(x, hook=hook)
-        x, hook = self.mlp(x_attn, hook=hook)
+        x, moe_loss, hook = self.mlp(x_attn, hook=hook)
+        if hook is not None:
+            hook[f"moe_loss_layer_{self.layer}"] = moe_loss
         return x, attn, hook
-
-    def get_aux_loss(self):
-        if hasattr(self.mlp, 'load_balancing_loss'):
-            if self.mlp.load_balancing_loss is not None:
-                return self.aux_loss_weight * self.mlp.load_balancing_loss
-        return torch.tensor(0.0, device=next(self.parameters()).device)

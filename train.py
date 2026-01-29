@@ -133,7 +133,7 @@ parser = argparse.ArgumentParser(description="PyTorch ImageNet Training")
 parser.add_argument(
     "-data-dir",
     metavar="DIR",
-    default="",
+    default="/scratch1/bkrhee/data",
     help="path to dataset",
 )
 parser.add_argument(
@@ -816,7 +816,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--output",
-    default="",
+    default="/scratch1/bkrhee/Spike-Driven-Transformer_MoE/output",
     type=str,
     metavar="PATH",
     help="path to output folder (default: none, current dir)",
@@ -1488,21 +1488,19 @@ def train_one_epoch(
             input = input.contiguous(memory_format=torch.channels_last)
 
         with amp_autocast():
-            output = model(input)[0]
+            hook = {}
+            output, hook = model(input, hook=hook)
             if args.TET:
                 loss = criterion.TET_loss(
                     output, target, loss_fn, means=args.TET_means, lamb=args.TET_lamb
                 )
             else:
                 loss = loss_fn(output, target)
-            aux_loss = None
-            if hasattr(model, 'get_aux_loss'):
-                aux_loss = model.get_aux_loss()
-            elif hasattr(model, 'module') and hasattr(model.module, 'get_aux_loss'):
-                aux_loss = model.module.get_aux_loss()
-            
-            if aux_loss is not None:
-                loss += aux_loss
+            moe_losses = [
+                v for k, v in hook.items() if k.startswith("moe_loss_layer_")
+            ]
+            # if moe_losses:
+            #     loss = loss + torch.stack(moe_losses).sum()
         sample_number += input.shape[0]
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))

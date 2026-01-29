@@ -75,7 +75,7 @@ parser = argparse.ArgumentParser(description="PyTorch ImageNet Training")
 parser.add_argument(
     "-data-dir",
     metavar="DIR",
-    default="",
+    default="/scratch1/bkrhee/data",
     help="path to dataset",
 )
 parser.add_argument(
@@ -751,9 +751,52 @@ parser.add_argument(
     default=False,
     help="disable fast prefetcher",
 )
+
+## added for inspection
+parser.add_argument(
+    "--print-moe",
+    action="store_true",
+    default=False,
+    help="print MoE expert routing summary during inference",
+)
+parser.add_argument(
+    "--print-moe-batches",
+    type=int,
+    default=1,
+    metavar="N",
+    help="number of batches to print MoE routing (default: 1)",
+)
+parser.add_argument(
+    "--print-moe-detail",
+    action="store_true",
+    default=False,
+    help="print per-token MoE routing with full softmax distribution",
+)
+parser.add_argument(
+    "--print-moe-max-tokens",
+    type=int,
+    default=None,
+    metavar="N",
+    help="max tokens to print per module (default: all tokens)",
+)
+parser.add_argument(
+    "--max-batches",
+    type=int,
+    default=None,
+    metavar="N",
+    help="limit number of validation batches (default: all)",
+)
+parser.add_argument(
+    "--first-sample-only",
+    action="store_true",
+    default=False,
+    help="use only the first sample in each batch (index 0)",
+)
+####
+
 parser.add_argument(
     "--output",
-    default="",
+    default="/scratch1/bkrhee/Spike-Driven-Transformer_MoE/output",
     type=str,
     metavar="PATH",
     help="path to output folder (default: none, current dir)",
@@ -1135,7 +1178,8 @@ def main():
         if args.local_rank == 0:
             non_zero_str = json.dumps(eval_metrics["non_zero"], indent=4)
             firing_rate_str = json.dumps(eval_metrics["firing_rate"], indent=4)
-            _logger.info("top-1:", eval_metrics["top1"])
+            _logger.info("top-1: %s", eval_metrics["top1"])
+            # _logger.info("top-1:", eval_metrics["top1"])
             _logger.info("non_zero: ")
             _logger.info(non_zero_str)
             _logger.info("firing_rate: ")
@@ -1155,31 +1199,132 @@ def validate(
     top1_m = AverageMeter()
     top5_m = AverageMeter()
 
-    def calc_non_zero_rate(s_dict, nz_dict, idx, t):
+    def _time_slice(v_, t, T):
+        # must be a tensor
+        if not torch.is_tensor(v_):
+            return None
+
+        # skip scalars (ex: moe_loss_layer_*)
+        if v_.dim() == 0:
+            return None
+
+        # we only handle tensors that are time-major: [T, ...]
+        if v_.shape[0] != T:
+            return None
+
+        return v_[t]
+
+
+    def calc_non_zero_rate(s_dict, nz_dict, denom, t, T):
         for k, v_ in s_dict.items():
-            v = v_[t, ...]
-            x_shape = torch.tensor(list(v.shape))
-            all_neural = torch.prod(x_shape)
-            z = torch.nonzero(v)
-            if k in nz_dict.keys():
-                nz_dict[k] += (z.shape[0] / all_neural).item() / idx
-            else:
-                nz_dict[k] = (z.shape[0] / all_neural).item() / idx
+            v = _time_slice(v_, t, T)
+            if v is None:
+                continue
+
+            # optional: skip any routing indices if you add them later
+            # if "routing_indices" in k:
+            #     continue
+
+            numel = v.numel()
+            if numel == 0:
+                continue
+            nz = torch.count_nonzero(v).item()
+            nz_dict[k] = nz_dict.get(k, 0.0) + (nz / numel) / denom
         return nz_dict
 
-    def calc_firing_rate(s_dict, fr_dict, idx, t):
+
+    def calc_firing_rate(s_dict, fr_dict, denom, t, T):
         for k, v_ in s_dict.items():
-            v = v_[t, ...]
-            if k in fr_dict.keys():
-                fr_dict[k] += v.mean().item() / idx
-            else:
-                fr_dict[k] = v.mean().item() / idx
+            v = _time_slice(v_, t, T)
+            if v is None:
+                continue
+
+            fr_dict[k] = fr_dict.get(k, 0.0) + v.mean().item() / denom
         return fr_dict
+
+    def log_moe_routing(batch_idx):
+        # Local import to avoid NameError if module import is stripped in some environments
+        from module.ms_conv import Top2Gating
+
+        
+        if not args.print_moe or args.local_rank != 0:
+            return
+        if args.print_moe_batches is not None and batch_idx >= args.print_moe_batches:
+            return
+        for name, module in model.named_modules():
+            if not isinstance(module, Top2Gating):
+                continue
+            if module.last_masks is None:
+                continue
+            for k, mask in enumerate(module.last_masks):
+                # mask: (B, N, E) -> counts per expert
+                counts = (
+                    mask.sum(dim=(0, 1)).to(torch.int64).detach().cpu().tolist()
+                )
+                print(f"[batch {batch_idx}] {name} top{k + 1} counts: {counts}")
+            if args.print_moe_detail and module.last_raw_gates is not None:
+                probs = module.last_raw_gates.detach().cpu()  # (B, N, E)
+                indices = module.last_indices
+                if indices is not None:
+                    indices = [idx.detach().cpu() for idx in indices]
+                B, N, E = probs.shape
+                max_tokens = args.print_moe_max_tokens
+                token_idx = 0
+                for b in range(B):
+                    for n in range(N):
+                        if max_tokens is not None and token_idx >= max_tokens:
+                            return
+                        token_idx += 1
+                        topk = []
+                        if indices is not None:
+                            for k, idx in enumerate(indices):
+                                topk.append(
+                                    {
+                                        "k": k + 1,
+                                        "expert": int(idx[b, n].item()),
+                                        "prob": float(probs[b, n, idx[b, n]].item()),
+                                    }
+                                )
+                        print(
+                            f"[batch {batch_idx}] {name} token b{b} n{n} topk={topk} probs={probs[b, n].tolist()}"
+                        )
+
+
+    # def calc_non_zero_rate(s_dict, nz_dict, idx, t):
+    #     for k, v_ in s_dict.items():
+    #         v = v_[t, ...]
+    #         x_shape = torch.tensor(list(v.shape))
+    #         all_neural = torch.prod(x_shape)
+    #         z = torch.nonzero(v)
+    #         if k in nz_dict.keys():
+    #             nz_dict[k] += (z.shape[0] / all_neural).item() / idx
+    #         else:
+    #             nz_dict[k] = (z.shape[0] / all_neural).item() / idx
+    #     return nz_dict
+
+    # def calc_firing_rate(s_dict, fr_dict, idx, t):
+    #     for k, v_ in s_dict.items():
+    #         v = v_[t, ...]
+    #         if k in fr_dict.keys():
+    #             fr_dict[k] += v.mean().item() / idx
+    #         else:
+    #             fr_dict[k] = v.mean().item() / idx
+    #     return fr_dict
 
     model.eval()
 
     end = time.time()
-    last_idx = len(loader) - 1
+    
+    #### removed last_idx for now
+    # last_idx = len(loader) - 1
+    ## added this
+    max_batches = args.max_batches
+    if max_batches is None:
+        last_idx = len(loader) - 1
+    else:
+        last_idx = min(len(loader), max_batches) - 1
+
+    
     fr_dict, nz_dict = {"t0": dict(), "t1": dict(), "t2": dict(), "t3": dict()}, {
         "t0": dict(),
         "t1": dict(),
@@ -1188,12 +1333,22 @@ def validate(
     }
     with torch.no_grad():
         for batch_idx, (input, target) in enumerate(loader):
+            ##
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+            denom= len(loader)
+
             last_batch = batch_idx == last_idx
             if not args.prefetcher:
                 input = input.cuda()
             target = target.cuda()
             if args.channels_last:
                 input = input.contiguous(memory_format=torch.channels_last)
+
+            ######
+            if args.first_sample_only:
+                input = input[:1]
+                target = target[:1]
 
             with amp_autocast():
                 output, firing_dict = model(input, hook=dict())
@@ -1202,15 +1357,20 @@ def validate(
                         firing_dict, os.path.join(output_dir, f"qkv_{batch_idx}.pkl")
                     )
 
+                ###
+                log_moe_routing(batch_idx)
+
             for t in range(args.time_steps):
-                fr_single_dict = calc_firing_rate(
-                    firing_dict, fr_dict["t" + str(t)], last_idx, t
-                )
-                fr_dict["t" + str(t)] = fr_single_dict
-                nz_single_dict = calc_non_zero_rate(
-                    firing_dict, nz_dict["t" + str(t)], last_idx, t
-                )
-                nz_dict["t" + str(t)] = nz_single_dict
+                # fr_single_dict = calc_firing_rate(
+                #     firing_dict, fr_dict["t" + str(t)], last_idx, t
+                # )
+                fr_dict[f"t{t}"] = calc_firing_rate(firing_dict, fr_dict[f"t{t}"], denom, t, args.time_steps)
+                # fr_dict["t" + str(t)] = fr_single_dict
+                # nz_single_dict = calc_non_zero_rate(
+                #     firing_dict, nz_dict["t" + str(t)], last_idx, t
+                # )
+                nz_dict[f"t{t}"] = calc_non_zero_rate(firing_dict, nz_dict[f"t{t}"], denom, t, args.time_steps)
+                #nz_dict["t" + str(t)] = nz_single_dict
 
             # augmentation reduction
             reduce_factor = args.tta
