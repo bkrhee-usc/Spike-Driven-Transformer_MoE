@@ -47,11 +47,11 @@ amp: False
 channels-last: False
 batch_size: 64
 val_batch_size: 64
-lr: 3e-4
+lr: 5e-4
 min_lr: 1e-5
 sched: cosine
 weight_decay: 6e-2
-epochs: 300
+epochs: 200
 cooldown_epochs: 10
 warmup_epochs: 20
 warmup_lr: 1e-6
