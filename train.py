@@ -4,12 +4,17 @@ import yaml
 import os
 import logging
 import numpy as np
+import random as rd
 from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime
 from spikingjelly.clock_driven import functional
 from spikingjelly.datasets.cifar10_dvs import CIFAR10DVS
 from spikingjelly.datasets.dvs128_gesture import DVS128Gesture
+from spikingjelly.clock_driven.neuron import (
+    MultiStepLIFNode,
+    MultiStepParametricLIFNode,
+)
 import torch
 import torch.nn as nn
 import torchvision.utils
@@ -947,6 +952,9 @@ def main():
     torch.cuda.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     random_seed(args.seed, args.rank)
+    
+    torch.backends.cudnn.deterministic = True
+    rd.seed(args.seed)
 
     args.dvs_mode = False
     if args.dataset in ["cifar10-dvs-tet", "cifar10-dvs"]:
@@ -1059,9 +1067,80 @@ def main():
         assert not use_amp == "apex", "Cannot use APEX AMP with torchscripted model"
         assert not args.sync_bn, "Cannot use SyncBatchNorm with torchscripted model"
         model = torch.jit.script(model)
-
+    ########################
     optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
+    ########################
 
+    # Separate expert and non-expert parameters with different learning rates
+    # num_experts = 2  # or get from args if you add it to config
+    # import math
+    # expert_lr_scale = math.sqrt(num_experts)
+    # expert_lr_scale = num_experts  # scale factor for expert LR
+    # expert_lr_scale = 1
+
+    # expert_params = []
+    # other_params = []
+
+    # for name, param in model.named_parameters():
+    #     if not param.requires_grad:
+    #         continue
+    #     if '.experts.' in name or '.mlp.experts.' in name:
+    #         expert_params.append(param)
+    #     else:
+    #         other_params.append(param)
+
+    # base_lr = args.lr
+    # opt_args = optimizer_kwargs(cfg=args)
+
+    # # Create param groups with different LRs
+    # param_groups = [
+    #     {'params': other_params, 'lr': base_lr},
+    #     {'params': expert_params, 'lr': base_lr * expert_lr_scale},
+    # ]
+
+    # # Remove 'lr' from opt_args since we set it per group
+    # opt_args.pop('lr', None)
+
+    # optimizer = create_optimizer_v2(param_groups, **opt_args)
+
+    # if args.local_rank == 0:
+    #     _logger.info(f"Expert LR: {base_lr * expert_lr_scale}, Other LR: {base_lr}")
+    #     _logger.info(f"Expert params: {len(expert_params)}, Other params: {len(other_params)}")
+    
+    # Separate router and other parameters with different learning rates
+    # router_lr_scale = 10  # scale factor for router LR
+
+    # router_params = []
+    # other_params = []
+
+    # for name, param in model.named_parameters():
+    #     if not param.requires_grad:
+    #         continue
+    #     if '.gate.w_gating' in name or '.gate.gate_spatial' in name:
+    #         router_params.append(param)
+    #     else:
+    #         other_params.append(param)
+
+    # base_lr = args.lr
+    # opt_args = optimizer_kwargs(cfg=args)
+
+    # # Create param groups with different LRs
+    # param_groups = [
+    #     {'params': other_params, 'lr': base_lr},
+    #     {'params': router_params, 'lr': base_lr * router_lr_scale},
+    # ]
+
+    # # Remove 'lr' from opt_args since we set it per group
+    # opt_args.pop('lr', None)
+
+    # optimizer = create_optimizer_v2(param_groups, **opt_args)
+
+    # if args.local_rank == 0:
+    #     _logger.info(f"Router LR: {base_lr * router_lr_scale}, Other LR: {base_lr}")
+    #     _logger.info(f"Router params: {len(router_params)}, Other params: {len(other_params)}")
+
+
+    
     # setup automatic mixed-precision (AMP) loss scaling and op casting
     amp_autocast = suppress  # do nothing
     loss_scaler = None
@@ -1499,8 +1578,8 @@ def train_one_epoch(
             moe_losses = [
                 v for k, v in hook.items() if k.startswith("moe_loss_layer_")
             ]
-            # if moe_losses:
-            #     loss = loss + torch.stack(moe_losses).sum()
+            if moe_losses:
+                loss = loss + torch.stack(moe_losses).sum()
         sample_number += input.shape[0]
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))
@@ -1520,6 +1599,135 @@ def train_one_epoch(
         else:
             # loss.backward()
             loss.backward(create_graph=second_order)
+            # Log gradient statistics for router and experts (per-expert breakdown)
+            if args.local_rank == 0 and batch_idx % args.log_interval == 0:
+                import re
+                from collections import defaultdict
+
+                router_grad_norms = {}  # layer -> grad_norm
+                expert_grad_norms = defaultdict(lambda: defaultdict(list))  # layer -> expert_id -> [grad_norms]
+                other_grad_norms = []
+
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+
+                        if '.gate.w_gating' in name or '.gate.gate_spatial' in name:
+                            # Extract layer info: e.g., "block.0.mlp.gate.w_gating" -> layer 0
+                            layer_match = re.search(r'block\.(\d+)\.', name)
+                            layer_id = layer_match.group(1) if layer_match else '0'
+                            router_grad_norms[layer_id] = grad_norm
+
+                        elif '.experts.' in name:
+                            # Extract layer and expert id: e.g., "block.0.mlp.experts.2.fc1_conv" -> layer 0, expert 2
+                            layer_match = re.search(r'block\.(\d+)\.', name)
+                            expert_match = re.search(r'\.experts\.(\d+)\.', name)
+                            layer_id = layer_match.group(1) if layer_match else '0'
+                            expert_id = expert_match.group(1) if expert_match else '0'
+                            expert_grad_norms[layer_id][expert_id].append(grad_norm)
+
+                        else:
+                            other_grad_norms.append(grad_norm)
+
+                # Log per-layer, per-expert gradients
+                if router_grad_norms:
+                    for layer_id in sorted(router_grad_norms.keys(), key=int):
+                        router_grad = router_grad_norms[layer_id]
+
+                        # Compute per-expert average gradient
+                        expert_grads_str = []
+                        expert_grads_values = []
+                        for expert_id in sorted(expert_grad_norms[layer_id].keys(), key=int):
+                            grads = expert_grad_norms[layer_id][expert_id]
+                            avg_grad = sum(grads) / len(grads) if grads else 0
+                            expert_grads_values.append(avg_grad)
+                            expert_grads_str.append(f"E{expert_id}:{avg_grad:.4f}")
+
+                        avg_expert_grad = sum(expert_grads_values) / len(expert_grads_values) if expert_grads_values else 0
+
+                        _logger.info(
+                            f"Layer {layer_id} Gradients - Router: {router_grad:.6f}, "
+                            f"Experts: [{', '.join(expert_grads_str)}], "
+                            f"Ratio (Router/AvgExpert): {router_grad / (avg_expert_grad + 1e-9):.4f}"
+                        )
+
+                    # Also log overall summary
+                    avg_router = sum(router_grad_norms.values()) / len(router_grad_norms)
+                    all_expert_grads = [g for layer in expert_grad_norms.values() for expert in layer.values() for g in expert]
+                    avg_expert = sum(all_expert_grads) / len(all_expert_grads) if all_expert_grads else 0
+                    avg_other = sum(other_grad_norms) / len(other_grad_norms) if other_grad_norms else 0
+
+                    _logger.info(
+                        f"Overall Gradients - Router: {avg_router:.6f}, Expert: {avg_expert:.6f}, "
+                        f"Other: {avg_other:.6f}, Ratio: {avg_router / (avg_expert + 1e-9):.4f}"
+                    )
+                # Log PLIF tau values per expert (only if using plif mode)
+                # if args.spike_mode == "plif":
+                expert_taus = defaultdict(lambda: defaultdict(dict))  # layer -> expert_id -> {fc1: tau, fc2: tau, fc1_grad: grad, fc2_grad: grad}
+
+                for name, module in model.named_modules():
+                    if isinstance(module, MultiStepParametricLIFNode) and '.experts.' in name:
+                        # Extract layer and expert id
+                        layer_match = re.search(r'block\.(\d+)\.', name)
+                        expert_match = re.search(r'\.experts\.(\d+)\.', name)
+                        layer_id = layer_match.group(1) if layer_match else '0'
+                        expert_id = expert_match.group(1) if expert_match else '0'
+
+                        # Determine if fc1 or fc2
+                        if 'fc1_lif' in name:
+                            lif_type = 'fc1'
+                        elif 'fc2_lif' in name:
+                            lif_type = 'fc2'
+                        else:
+                            lif_type = 'other'
+
+                        # Get tau value (tau = 1 / sigmoid(w))
+                        if hasattr(module, 'w'):
+                            tau = 1.0 / torch.sigmoid(module.w).item()
+                            w_grad = module.w.grad.item() if module.w.grad is not None else 0.0
+                            expert_taus[layer_id][expert_id][lif_type] = tau
+                            expert_taus[layer_id][expert_id][f'{lif_type}_grad'] = w_grad
+
+                # Log tau values per layer, per expert
+                if expert_taus:
+                    for layer_id in sorted(expert_taus.keys(), key=int):
+                        tau_strs = []
+                        for expert_id in sorted(expert_taus[layer_id].keys(), key=int):
+                            taus = expert_taus[layer_id][expert_id]
+                            fc1_tau = taus.get('fc1', 0)
+                            fc2_tau = taus.get('fc2', 0)
+                            fc1_grad = taus.get('fc1_grad', 0)
+                            fc2_grad = taus.get('fc2_grad', 0)
+                            tau_strs.append(f"E{expert_id}:(fc1={fc1_tau:.3f}|g={fc1_grad:.6f}, fc2={fc2_tau:.3f}|g={fc2_grad:.6f})")
+
+                        _logger.info(f"Layer {layer_id} PLIF Tau - [{', '.join(tau_strs)}]")
+            # # Log gradient statistics for router and experts
+            # if args.local_rank == 0 and batch_idx % args.log_interval == 0:
+            #     router_grad_norms = []
+            #     expert_grad_norms = []
+            #     other_grad_norms = []
+
+            #     for name, param in model.named_parameters():
+            #         if param.grad is not None:
+            #             grad_norm = param.grad.norm().item()
+            #             if '.gate.w_gating' in name:
+            #                 router_grad_norms.append((name, grad_norm))
+            #             elif '.experts.' in name:
+            #                 expert_grad_norms.append((name, grad_norm))
+            #             else:
+            #                 other_grad_norms.append((name, grad_norm))
+
+            #     if router_grad_norms:
+            #         avg_router_grad = sum(g for _, g in router_grad_norms) / len(router_grad_norms)
+            #         avg_expert_grad = sum(g for _, g in expert_grad_norms) / len(expert_grad_norms) if expert_grad_norms else 0
+            #         avg_other_grad = sum(g for _, g in other_grad_norms) / len(other_grad_norms) if other_grad_norms else 0
+
+            #         _logger.info(
+            #             f"Gradient Norms - Router: {avg_router_grad:.6f}, "
+            #             f"Expert: {avg_expert_grad:.6f}, "
+            #             f"Other: {avg_other_grad:.6f}, "
+            #             f"Ratio (Router/Expert): {avg_router_grad / (avg_expert_grad + 1e-9):.4f}"
+            #         )
             if args.clip_grad is not None:
                 dispatch_clip_grad(
                     model_parameters(model, exclude_head="agc" in args.clip_mode),
