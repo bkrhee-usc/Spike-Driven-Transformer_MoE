@@ -81,14 +81,35 @@ class MS_MLP_Expert(nn.Module):
         drop=0.0,
         spike_mode="lif",
         layer=0,
-        tau=2.0
+        tau=2.0,
+
+        ## Added for shared Batchnorm
+        # shared_fc1_bn=None,  # Shared BatchNorm for fc1 (optional)
+        # shared_fc2_bn=None,  # Shared BatchNorm for fc2 (optional)
+
+        # use_shared_bn=False,  # If True, BatchNorm will be passed in forward()
     ):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         self.res = in_features == hidden_features
         self.fc1_conv = nn.Conv2d(in_features, hidden_features, kernel_size=1, stride=1)
+
         self.fc1_bn = nn.BatchNorm2d(hidden_features)
+
+        # Use shared BatchNorm if provided, otherwise create own
+        # self.fc1_bn = shared_fc1_bn if shared_fc1_bn is not None else nn.BatchNorm2d(hidden_features)
+        # self.use_shared_bn = shared_fc1_bn is not None
+        # self.use_shared_bn = use_shared_bn
+
+
+        # Only create own BatchNorm if not using shared
+        # if not use_shared_bn:
+        #     self.fc1_bn = nn.BatchNorm2d(hidden_features)
+        #     self.fc2_bn = nn.BatchNorm2d(out_features)
+
+
+
         if spike_mode == "lif":
             self.fc1_lif = MultiStepLIFNode(tau=tau, detach_reset=True, backend="cupy")
         elif spike_mode == "plif":
@@ -99,7 +120,9 @@ class MS_MLP_Expert(nn.Module):
         self.fc2_conv = nn.Conv2d(
             hidden_features, out_features, kernel_size=1, stride=1
         )
+
         self.fc2_bn = nn.BatchNorm2d(out_features)
+
         if spike_mode == "lif":
             self.fc2_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend="cupy")
         elif spike_mode == "plif":
@@ -118,6 +141,7 @@ class MS_MLP_Expert(nn.Module):
             if hasattr(m, "reset"):
                 m.reset()
 
+    # def forward(self, x, hook=None, shared_fc1_bn=None, shared_fc2_bn=None):
     def forward(self, x, hook=None):
         T, B, C, H, W = x.shape
         identity = x
@@ -127,6 +151,11 @@ class MS_MLP_Expert(nn.Module):
             hook[self._get_name() + str(self.layer) + "_fc1_lif"] = x.detach()
         x = self.fc1_conv(x.flatten(0, 1))
         x = self.fc1_bn(x).reshape(T, B, self.c_hidden, H, W).contiguous()
+
+        # Use shared or own BatchNorm
+        # fc1_bn = shared_fc1_bn if self.use_shared_bn else self.fc1_bn
+        # x = fc1_bn(x).reshape(T, B, self.c_hidden, H, W).contiguous()
+
         if self.res:
             x = identity + x
             identity = x
@@ -135,6 +164,10 @@ class MS_MLP_Expert(nn.Module):
             hook[self._get_name() + str(self.layer) + "_fc2_lif"] = x.detach()
         x = self.fc2_conv(x.flatten(0, 1))
         x = self.fc2_bn(x).reshape(T, B, C, H, W).contiguous()
+
+        # Use shared or own BatchNorm
+        # fc2_bn = shared_fc2_bn if self.use_shared_bn else self.fc2_bn
+        # x = fc2_bn(x).reshape(T, B, C, H, W).contiguous()
 
         # x = x + identity
         return x, hook
@@ -316,6 +349,7 @@ class Top2Gating(nn.Module):
         num_gates,
         eps = 1e-9,
         ##
+        # top_k = 2,
         top_k = 1,
         outer_expert_dims = tuple(),
         second_policy_train = 'random',
@@ -324,15 +358,19 @@ class Top2Gating(nn.Module):
         second_threshold_eval = 0.2,
         capacity_factor_train = 4.,
         capacity_factor_eval = 4.
-        #capacity_factor_train = 1.25,
-        #capacity_factor_eval = 2.
+        # capacity_factor_train = 1.25,
+        # # capacity_factor_train = 2.,
+        # capacity_factor_eval = 2.
         ):
         super().__init__()
 
         self.eps = eps
         self.num_gates = num_gates
-        self.top_k = top_k  
-        # self.w_gating = nn.Parameter(torch.randn(*outer_expert_dims, dim, num_gates))
+        self.top_k = top_k
+        # Spatial enrichment: depthwise conv adds neighbor context to each token.
+        # Initialized small (std=0.02 from _init_weights) so router starts ≈ pure linear.
+        # self.gate_spatial = nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=False, groups=dim)
+        # Linear router: per-token projection to expert logits
         self.w_gating = nn.Parameter(torch.randn(dim, num_gates))
 
         self.second_policy_train = second_policy_train
@@ -363,11 +401,18 @@ class Top2Gating(nn.Module):
             threshold = self.second_threshold_eval
             capacity_factor = self.capacity_factor_eval
 
-        # Pool over time
+        # Pool over time, keeping spatial structure for conv
+        # x_pooled = x.mean(dim=0)  # B, C, H, W
+
+        # Spatial enrichment: add neighbor context via depthwise conv (residual)
+        # x_enriched = x_pooled + self.gate_spatial(x_pooled)  # B, C, H, W
+
+        # Flatten to tokens, then linear projection to expert logits
+        # x_tok = x_enriched.flatten(2).permute(0, 2, 1).contiguous()  # B, N, C
         x_tok = x.flatten(3).permute(0, 1, 3, 2).contiguous()  # T, B, N, C
         x_pooled = x_tok.mean(dim=0)  # B, N, C
 
-        raw_gates = torch.einsum('bnd,de->bne', x_pooled, self.w_gating)
+        raw_gates = torch.einsum('bnc,ce->bne', x_pooled, self.w_gating)  # B, N, num_gates
         raw_gates = raw_gates.softmax(dim=-1)
 
         # Store masks, gates, indices, and positions for all top-k
@@ -411,26 +456,28 @@ class Top2Gating(nn.Module):
             # Remove selected expert from remaining gates for next iteration
             gates_remaining = gates_remaining * (1. - mask_k)
         
-        # Normalize gates
-        gate_sum = sum(gates) + self.eps
-        gates = [g / gate_sum for g in gates]
+        # Normalize gates (only needed for top_k > 1)
+        if self.top_k > 1:
+            gate_sum = sum(gates) + self.eps
+            gates = [g / gate_sum for g in gates]
         
         # Compute balancing loss (using first expert)
         density_1 = masks[0].mean(dim=-2)
         density_1_proxy = raw_gates.mean(dim=-2)
         loss = (density_1_proxy * density_1).mean() * float(num_gates ** 2)
         
-        # Apply policies to non-first experts
-        for k in range(1, self.top_k):
-            if policy == "all":
-                pass
-            elif policy == "none":
-                masks[k] = torch.zeros_like(masks[k])
-            elif policy == "threshold":
-                masks[k] *= (gates[k] > threshold).float().unsqueeze(-1)
-            elif policy == "random":
-                probs = torch.zeros_like(gates[k]).uniform_(0., 1.)
-                masks[k] *= (probs < (gates[k] / max(threshold, self.eps))).float().unsqueeze(-1)
+        # Apply policies to non-first experts (only for top_k > 1)
+        if self.top_k > 1:
+            for k in range(1, self.top_k):
+                if policy == "all":
+                    pass
+                elif policy == "none":
+                    masks[k] = torch.zeros_like(masks[k])
+                elif policy == "threshold":
+                    masks[k] *= (gates[k] > threshold).float().unsqueeze(-1)
+                elif policy == "random":
+                    probs = torch.zeros_like(gates[k]).uniform_(0., 1.)
+                    masks[k] *= (probs < (gates[k] / max(threshold, self.eps))).float().unsqueeze(-1)
         
         # Compute expert capacity
         expert_capacity = min(group_size, int((group_size * capacity_factor) / num_gates))
@@ -482,7 +529,7 @@ class Top2Gating(nn.Module):
 class MoE(nn.Module):
     def __init__(self,
         dim,
-        num_experts = 2,
+        num_experts = 4,
         hidden_features=None,
         out_features=None,
         spike_mode="lif",
@@ -490,32 +537,59 @@ class MoE(nn.Module):
         second_policy_eval = 'random',
         second_threshold_train = 0.2,
         second_threshold_eval = 0.2,
-        capacity_factor_train = 1.25,
-        capacity_factor_eval = 2.,
+        capacity_factor_train = 4.,
+        capacity_factor_eval = 4.,
+        # capacity_factor_train = 1.25,
+        # capacity_factor_train = 2.,
+        # capacity_factor_eval = 2.,
         loss_coef = 1e-2,
 
         ##
-        top_k = 1,  
+        # top_k = 2,  
+        top_k = 1,
         experts = None):
         super().__init__()
 
         self.num_experts = num_experts
-        tau_min = 2
-        tau_max = 2
+        tau_min = 1.8
+        tau_max = 3.0
+
+        # tau_values = [tau_min + (tau_max - tau_min) * i / (num_experts - 1) for i in range(num_experts)]
+        tau_values = (
+            [tau_min] * (num_experts // 2) +
+            [tau_max] * (num_experts - num_experts // 2)
+        )
 
         gating_kwargs = {'top_k' : top_k, 'second_policy_train': second_policy_train, 'second_policy_eval': second_policy_eval, 'second_threshold_train': second_threshold_train, 'second_threshold_eval': second_threshold_eval, 'capacity_factor_train': capacity_factor_train, 'capacity_factor_eval': capacity_factor_eval}
         # gating_kwargs = {'second_policy_train': second_policy_train, 'second_policy_eval': second_policy_eval, 'second_threshold_train': second_threshold_train, 'second_threshold_eval': second_threshold_eval, 'capacity_factor_train': capacity_factor_train, 'capacity_factor_eval': capacity_factor_eval}
         self.gate = Top2Gating(dim, num_gates = num_experts, **gating_kwargs)
+
+        # # Create shared BatchNorms for all experts
+        # mlp_hidden_dim = hidden_features or dim * 4
+        # self.shared_fc1_bn = nn.BatchNorm2d(mlp_hidden_dim)
+        # self.shared_fc2_bn = nn.BatchNorm2d(out_features or dim)
+        
+
         self.experts = nn.ModuleList([
             MS_MLP_Expert(
                 in_features=dim,
                 hidden_features=hidden_features,
                 out_features=out_features,
-                spike_mode=spike_mode,
+                spike_mode='lif',
+                # tau = tau_values[i],
                 tau=2.0,
+
+                # use_shared_bn = True,
             )
             for i in range(num_experts)
         ])
+        # Each expert processes a different number of timesteps: [1, 2, ..., num_experts]
+        # self.expert_timesteps = list(range(1, num_experts + 1))
+        # self.expert_timesteps = [4, 3, 2, 1]
+        # self.expert_timesteps = [4, 1, 1, 1]
+        # self.expert_timesteps = [1, 1, 4, 4]
+        # self.expert_timesteps = [4, 4, 1, 1]
+        self.expert_timesteps = [1, 1, 1, 4]  # 3 cheap experts + 1 full-timestep expert
         self.loss_coef = loss_coef
 
     def forward(self, inputs, hook = None, **kwargs):
@@ -546,17 +620,29 @@ class MoE(nn.Module):
         expert_outputs_list = []
         
         for expert_id in range(E):
+            t_e = min(self.expert_timesteps[expert_id], T)
+
             # expert : MLP with channel projection (1x1) --> change input shape from T, B, Ccap, D to T, B, D, 1, Ccap
             expert_input = expert_inputs[:, expert_id, :, :, :]  # (T, B, Ccap, D)
 
             expert_input_spatial = expert_input.permute(0, 1, 3, 2) # T, B, D, Ccap
             expert_input_spatial = expert_input_spatial.unsqueeze(-2) # T, B, D, 1, Ccap
 
-            expert_output_spatial, _ = self.experts[expert_id](expert_input_spatial, hook=hook)
+            # Only process first t_e timesteps for this expert
+            expert_output_trimmed, _ = self.experts[expert_id](expert_input_spatial[:t_e], hook=hook)
+
+            # Pad remaining timesteps by repeating last output
+            if t_e < T:
+                expert_output_spatial = torch.cat(
+                    [expert_output_trimmed, expert_output_trimmed[-1:].expand(T - t_e, -1, -1, -1, -1)],
+                    dim=0
+                )
+            else:
+                expert_output_spatial = expert_output_trimmed
+
             expert_output = expert_output_spatial.squeeze(-2)  # (T, B, D, Ccap)
             expert_output = expert_output.permute(0, 1, 3, 2)  # (T, B, Ccap, D)
-            
-            
+
             expert_outputs_list.append(expert_output)
         
         # Stack all expert outputs: (E, T, B, Ccap, D) → (T, E, B, Ccap, D)
@@ -593,11 +679,12 @@ class MS_Block_Conv(nn.Module):
         spike_mode="lif",
         dvs=False,
         layer=0,
-        num_experts = 2,
+        num_experts = 4,
         loss_coef=1e-2,
 
         ##
-        top_k = 1,  
+        # top_k = 2,  
+        top_k = 1,
     ):
         super().__init__()
 
@@ -625,7 +712,7 @@ class MS_Block_Conv(nn.Module):
             num_experts=num_experts,
             hidden_features=mlp_hidden_dim,
             out_features=dim,
-            spike_mode=spike_mode,
+            spike_mode='lif',
             loss_coef=loss_coef,
 
             ##
