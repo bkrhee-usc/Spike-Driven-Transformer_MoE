@@ -4,6 +4,7 @@ import yaml
 import json
 import os
 import numpy as np
+import random as rd
 import logging
 from collections import OrderedDict
 from contextlib import suppress
@@ -925,6 +926,10 @@ def main():
     torch.cuda.manual_seed_all(args.seed)
     random_seed(args.seed, args.rank)
 
+
+    # torch.backends.cudnn.deterministic = True
+    rd.seed(args.seed)
+
     args.dvs_mode = False
     if args.dataset in ["cifar10-dvs-tet", "cifar10-dvs"]:
         args.dvs_mode = True
@@ -1167,6 +1172,23 @@ def main():
             if args.local_rank == 0:
                 _logger.info("Distributing BatchNorm running means and vars")
             distribute_bn(model, args.world_size, args.dist_bn == "reduce")
+        
+        # # Run validation TWICE to check consistency
+        # for run_idx in range(2):
+        #     _logger.info(f"\n{'='*50}")
+        #     _logger.info(f"VALIDATION RUN {run_idx + 1}")
+        #     _logger.info(f"{'='*50}")
+
+        #     eval_metrics = validate(
+        #         model,
+        #         loader_eval,
+        #         validate_loss_fn,
+        #         args,
+        #         output_dir=output_dir,
+        #         amp_autocast=amp_autocast,
+        #     )
+        #     if args.local_rank == 0:
+        #         _logger.info("Run %d - top-1: %s", run_idx + 1, eval_metrics["top1"])
         eval_metrics = validate(
             model,
             loader_eval,
@@ -1312,7 +1334,8 @@ def validate(
     #     return fr_dict
 
     model.eval()
-
+    # functional.reset_net(model)
+    
     end = time.time()
     
     #### removed last_idx for now
@@ -1339,6 +1362,7 @@ def validate(
             denom= len(loader)
 
             last_batch = batch_idx == last_idx
+            # input = input.float()  # Ensure float32 like train.py
             if not args.prefetcher:
                 input = input.cuda()
             target = target.cuda()
