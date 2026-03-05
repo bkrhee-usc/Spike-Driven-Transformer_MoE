@@ -357,10 +357,16 @@ class Top2Gating(nn.Module):
         second_threshold_train = 0.2,
         second_threshold_eval = 0.2,
         capacity_factor_train = 4.,
-        capacity_factor_eval = 4.
+        capacity_factor_eval = 4.,
         # capacity_factor_train = 1.25,
         # # capacity_factor_train = 2.,
         # capacity_factor_eval = 2.
+
+        ### NEW: Added coefficient for spatial routing loss ###
+        # spatial_loss_coef = 0.001  
+        ### END NEW ###
+
+        
         ):
         super().__init__()
 
@@ -371,7 +377,28 @@ class Top2Gating(nn.Module):
         # Initialized small (std=0.02 from _init_weights) so router starts ≈ pure linear.
         # self.gate_spatial = nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=False, groups=dim)
         # Linear router: per-token projection to expert logits
-        self.w_gating = nn.Parameter(torch.randn(dim, num_gates))
+        # self.w_gating = nn.Parameter(torch.randn(dim, num_gates))
+
+        # Two-layer router MLP: (B, N, C) -> (B, N, E) # originally 512
+        router_hidden = dim
+        self.w_gating = nn.Sequential(
+            nn.Linear(dim, router_hidden, bias=False),
+            GELU(),
+            nn.Linear(router_hidden, router_hidden, bias=False),
+            GELU(),
+            nn.Linear(router_hidden, router_hidden, bias=False),
+            GELU(),
+            nn.Linear(router_hidden, num_gates, bias=False)
+        )
+        # self.gate_lif1 = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
+        # self.gate_lif2 = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
+        # self.gate_lif3 = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
+        # self.gate_lif4 = MultiStepLIFNode(tau=2.0, detach_reset=True, backend='cupy')
+        # self.gate_fc1 = nn.Linear(dim, router_hidden, bias=False)
+        # self.gate_fc2 = nn.Linear(router_hidden, router_hidden, bias=False)
+        # self.gate_fc3 = nn.Linear(router_hidden, router_hidden, bias=False)
+        # self.gate_fc4 = nn.Linear(router_hidden, num_gates, bias=False)
+
 
         self.second_policy_train = second_policy_train
         self.second_policy_eval = second_policy_eval
@@ -387,6 +414,15 @@ class Top2Gating(nn.Module):
         self.last_gates = None
         self.last_raw_gates = None
 
+        ### NEW: Store coefficient ###
+        # self.spatial_loss_coef = spatial_loss_coef
+        ### END NEW ###
+
+        ########### Removing softmax ###############
+        # self.lif_softmax = MultiStepLIFNode(tau=2.0, detach_reset=True, backend="cupy")
+        ############################################
+
+
     def forward(self, x, importance=None):
         T, B, dim, H, W = x.shape
         group_size = H * W
@@ -401,19 +437,61 @@ class Top2Gating(nn.Module):
             threshold = self.second_threshold_eval
             capacity_factor = self.capacity_factor_eval
 
-        # Pool over time, keeping spatial structure for conv
-        # x_pooled = x.mean(dim=0)  # B, C, H, W
-
-        # Spatial enrichment: add neighbor context via depthwise conv (residual)
-        # x_enriched = x_pooled + self.gate_spatial(x_pooled)  # B, C, H, W
 
         # Flatten to tokens, then linear projection to expert logits
         # x_tok = x_enriched.flatten(2).permute(0, 2, 1).contiguous()  # B, N, C
         x_tok = x.flatten(3).permute(0, 1, 3, 2).contiguous()  # T, B, N, C
+
+        ###########################################
         x_pooled = x_tok.mean(dim=0)  # B, N, C
 
-        raw_gates = torch.einsum('bnc,ce->bne', x_pooled, self.w_gating)  # B, N, num_gates
+        # raw_gates = torch.einsum('bnc,ce->bne', x_pooled, self.w_gating)  # B, N, num_gates
+        raw_gates = self.w_gating(x_pooled)  # (B, N, E)
         raw_gates = raw_gates.softmax(dim=-1)
+
+
+
+        # gelu -> lif
+        # x_gate = x_pooled.unsqueeze(0)          # (1, B, N, dim)
+        # x_gate = self.gate_lif1(x_gate)        # (1, B, N, dim)
+        # x_gate = self.gate_fc1(x_gate)         # (1, B, N, router_hidden)
+        # x_gate = self.gate_lif2(x_gate)        # (1, B, N, router_hidden)
+        # x_gate = self.gate_fc2(x_gate)         # (1, B, N, router_hidden)
+        # x_gate = self.gate_lif3(x_gate)        # (1, B, N, router_hidden)
+        # x_gate = self.gate_fc3(x_gate)         # (1, B, N, num_gates)
+        # x_gate = self.gate_lif4(x_gate)
+        # x_gate = self.gate_fc4(x_gate)
+        # x_gate = x_gate.squeeze(0)
+
+        # raw_gates = x_gate.softmax(dim = -1)
+        ##################################
+
+
+        ############################################
+        ####### Removing Softmax ###################
+        ############################################
+        # x_tok_new = torch.einsum('tbnc,ce->tbne', x_tok, self.w_gating) # T, B, N, E
+
+        # x_tok_new = self.lif_softmax(x_tok_new)
+        # # x_spike = x_tok.sum(dim=0)
+        # x_spike = x_tok_new.mean(dim=0)
+        # # raw_scores = torch.einsum('bnc,ce->bne', x_spike, self.w_gating)
+        # # Normalize to probability-like scores in [0, 1], sum_E = 1 for each token.
+        # # raw_scores = raw_scores.clamp(min=0.0)
+        # raw_gates = x_spike / (x_spike.sum(dim=-1, keepdim=True) + self.eps)
+
+        # ######
+
+        # x_pooled = x_tok.mean(dim=0)
+        
+        # raw_gates = torch.einsum('bnc,ce->bne', x_pooled, self.w_gating)
+        
+        # raw_gates = F.relu(raw_gates)
+
+        # raw_gates = raw_gates / (raw_gates.sum(dim=-1, keepdim=True) + self.eps)
+        #############################################
+
+
 
         # Store masks, gates, indices, and positions for all top-k
         masks = []
@@ -551,15 +629,7 @@ class MoE(nn.Module):
         super().__init__()
 
         self.num_experts = num_experts
-        tau_min = 1.8
-        tau_max = 3.0
-
-        # tau_values = [tau_min + (tau_max - tau_min) * i / (num_experts - 1) for i in range(num_experts)]
-        tau_values = (
-            [tau_min] * (num_experts // 2) +
-            [tau_max] * (num_experts - num_experts // 2)
-        )
-
+        
         gating_kwargs = {'top_k' : top_k, 'second_policy_train': second_policy_train, 'second_policy_eval': second_policy_eval, 'second_threshold_train': second_threshold_train, 'second_threshold_eval': second_threshold_eval, 'capacity_factor_train': capacity_factor_train, 'capacity_factor_eval': capacity_factor_eval}
         # gating_kwargs = {'second_policy_train': second_policy_train, 'second_policy_eval': second_policy_eval, 'second_threshold_train': second_threshold_train, 'second_threshold_eval': second_threshold_eval, 'capacity_factor_train': capacity_factor_train, 'capacity_factor_eval': capacity_factor_eval}
         self.gate = Top2Gating(dim, num_gates = num_experts, **gating_kwargs)
@@ -587,9 +657,26 @@ class MoE(nn.Module):
         # self.expert_timesteps = list(range(1, num_experts + 1))
         # self.expert_timesteps = [4, 3, 2, 1]
         # self.expert_timesteps = [4, 1, 1, 1]
+        # self.expert_timesteps = [4, 4, 4, 4] # baseline
+        self.expert_timesteps = [10, 10, 10, 1] # for dvsgesture
         # self.expert_timesteps = [1, 1, 4, 4]
         # self.expert_timesteps = [4, 4, 1, 1]
-        self.expert_timesteps = [1, 1, 1, 4]  # 3 cheap experts + 1 full-timestep expert
+        # self.expert_timesteps = [1, 1, 1, 4]  # 3 cheap experts + 1 full-timestep expert
+
+
+
+        ############# For Pruning #################
+        # # Optional routing filter:
+        # # set to a list of expert ids to process only those tokens
+        # # e.g. [0] to keep only tokens routed to expert 0.
+        # # None keeps all experts (default behavior).
+
+
+        # self.only_expert_ids = [3]
+        ############# For Pruning #################
+
+
+
         self.loss_coef = loss_coef
 
     def forward(self, inputs, hook = None, **kwargs):
@@ -611,6 +698,22 @@ class MoE(nn.Module):
 
         Ccap = combine_tensor.shape[-1]
 
+        ############# For Pruning ######################
+        # Keep only selected expert routes (others become zero contribution).
+        # if self.only_expert_ids is not None:
+        #     keep = torch.zeros((1, 1, E, 1), device=combine_tensor.device, dtype=combine_tensor.dtype)
+        #     keep_ids = [eid for eid in self.only_expert_ids if 0 <= eid < E]
+        #     if len(keep_ids) > 0:
+        #         keep[:, :, keep_ids, :] = 1.0
+        #     dispatch_tensor = dispatch_tensor * keep
+        #     combine_tensor = combine_tensor * keep
+        #     selected_expert_ids = set(keep_ids)
+        # else:
+        #     selected_expert_ids = None
+
+        ############# For Pruning #################
+
+
         ## step 2
         x_tok = inputs.flatten(3).permute(0, 1, 3, 2).contiguous() # T, B, N, D
 
@@ -620,6 +723,16 @@ class MoE(nn.Module):
         expert_outputs_list = []
         
         for expert_id in range(E):
+
+            ############# For Pruning ######################
+            # if selected_expert_ids is not None and expert_id not in selected_expert_ids:
+            #     expert_outputs_list.append(
+            #         torch.zeros((T, B, Ccap, D), device=inputs.device, dtype=inputs.dtype)
+            #     )
+            #     continue
+            ############# For Pruning ######################
+            
+
             t_e = min(self.expert_timesteps[expert_id], T)
 
             # expert : MLP with channel projection (1x1) --> change input shape from T, B, Ccap, D to T, B, D, 1, Ccap
