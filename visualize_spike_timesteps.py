@@ -4,18 +4,11 @@ Uses PyTorch register_forward_hook to capture LIF outputs directly —
 no dependency on the model's internal hook dict.
 
 Usage:
-    python visualize_spike_timesteps.py \
-        -c conf/cifar100/2_512_300E_t4.yml \
-        --resume /path/to/checkpoint.pth.tar \
-        --image-idx 0 \
-        --output-dir ./spike_vis
-
-    # Average over N validation images:
-    python visualize_spike_timesteps.py \
-        -c conf/cifar100/2_512_300E_t4.yml \
-        --resume /path/to/checkpoint.pth.tar \
-        --num-images 100 \
-        --output-dir ./spike_vis
+    python visualize_spike_timesteps.py 
+        -c conf/conf_path
+        --resume /checkpoint.pth.tar
+        --image-idx 0 
+        --output-dir ./output_dir
 """
 
 import argparse
@@ -175,8 +168,6 @@ class ExpertSpikeCapture:
         self.data = OrderedDict()
         self.dispatch = OrderedDict()   # block_id -> dispatch_tensor
         self._handles = []
-        self._block_order = []          # track which block fires in which order
-        self._block_input_mean = {}     # block_id -> mean of input tensor
         self._register(net)
 
     def _register(self, net):
@@ -206,19 +197,6 @@ class ExpertSpikeCapture:
                 handle = module.register_forward_hook(self._make_gate_hook(label))
                 self._handles.append(handle)
                 print(f"  [hook] dispatch_{label}  <-  {name}")
-                continue
-
-        # 3) Block-level hooks — track processing order
-        block_pat = re.compile(r"^block\.(\d+)$")
-        for name, module in net.named_modules():
-            m = block_pat.match(name)
-            if m is not None:
-                block_id = int(m.group(1))
-                handle = module.register_forward_hook(
-                    self._make_block_order_hook(block_id)
-                )
-                self._handles.append(handle)
-                print(f"  [hook] block_order_{block_id}  <-  {name}")
 
     def _make_lif_hook(self, label):
         def hook_fn(module, input, output):
@@ -232,18 +210,9 @@ class ExpertSpikeCapture:
             self.dispatch[label] = dispatch_tensor
         return hook_fn
 
-    def _make_block_order_hook(self, block_id):
-        def hook_fn(module, input, output):
-            self._block_order.append(block_id)
-            x_in = input[0]  # (T, B, D, H, W) — input to this block
-            self._block_input_mean[block_id] = x_in.float().mean().item()
-        return hook_fn
-
     def clear(self):
         self.data.clear()
         self.dispatch.clear()
-        self._block_order.clear()
-        self._block_input_mean.clear()
 
     def remove_hooks(self):
         for h in self._handles:
@@ -966,30 +935,9 @@ def main():
                 print(f"  Captured {len(capture.data)} spike tensors, "
                       f"{len(capture.dispatch)} dispatch tensors")
                 for label, tensor in capture.data.items():
-                    print(f"    {label:40s}  shape={list(tensor.shape)}  "
-                          f"(t_e={tensor.shape[0]})")
+                    print(f"    {label:40s}  shape={list(tensor.shape)}")
                 for label, tensor in capture.dispatch.items():
                     print(f"    dispatch_{label:36s}  shape={list(tensor.shape)}")
-
-                # Diagnostic: show expert_timesteps from the MoE modules
-                for bname, bmodule in net.named_modules():
-                    if hasattr(bmodule, 'expert_timesteps'):
-                        print(f"  [diag] {bname}.expert_timesteps = "
-                              f"{bmodule.expert_timesteps}")
-
-                # Diagnostic: block processing order & input stats
-                print(f"\n  [diag] Block processing order: {capture._block_order}")
-                for bid in sorted(capture._block_input_mean.keys()):
-                    print(f"  [diag] Block {bid} input mean: "
-                          f"{capture._block_input_mean[bid]:.6f}")
-
-                # Diagnostic: verify hook data insertion order matches block order
-                print(f"\n  [diag] Hook data insertion order:")
-                for label in capture.data.keys():
-                    print(f"    {label}")
-                print(f"  [diag] Dispatch insertion order:")
-                for label in capture.dispatch.keys():
-                    print(f"    {label}")
 
             if count >= N:
                 break
@@ -1013,18 +961,6 @@ def main():
     print(f"\nAveraged over {count} image(s).")
     print(f"Found expert data for {len(accumulated)} (block, sublayer) groups.")
     print(f"Found spatial maps for {len(spatial_comb)} groups.\n")
-
-    # Per-block summary for cross-checking
-    print("=== Per-Block Firing Rate Summary ===")
-    for key in sorted(accumulated.keys()):
-        bl, sl = key
-        arr = accumulated[key]
-        E = arr.shape[0]
-        for e in range(E):
-            t_e = actual_t.get(key, {}).get(e, T)
-            print(f"  Block {bl} - {sl} - Expert {e} (t_e={t_e}): "
-                  f"mean={arr[e].mean():.6f}  per_t={[f'{v:.4f}' for v in arr[e]]}")
-    print()
 
     print_expert_table(accumulated, T, actual_t)
 
