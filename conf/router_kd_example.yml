@@ -1,0 +1,11 @@
+## Example config snippet for router self-KD (train_routerKD.py)
+## - Teacher: last block router distribution
+## - Students: all blocks except last
+##
+## Merge these into your existing dataset config as needed.
+router_kd: true
+router_kd_weight: 1.0
+router_kd_temp: 3.0
+router_kd_warmup: linear   # [none, linear]
+router_kd_warmup_epochs: 30
+

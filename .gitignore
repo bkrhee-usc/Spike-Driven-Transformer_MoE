@@ -10,3 +10,5 @@ pretrain.py
 *.npy
 *.zip
 visual/
+visual_ft/
+visual_sct/
