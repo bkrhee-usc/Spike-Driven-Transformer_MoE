@@ -1,5 +1,5 @@
 # Dataset / Model parameters
-data_dir: ./data/DVSGesturedataset/
+data_dir: /scratch1/bkrhee/data/DVSGesture/
 dataset: gesture
 pretrained: False
 num_classes: 11
@@ -31,7 +31,7 @@ amp: True
 channels-last: False
 batch_size: 16
 val_batch_size: 16
-lr: 2e-3
+lr: 3e-3
 min_lr: 1e-5
 sched: cosine
 weight_decay: 1e-4
@@ -42,3 +42,4 @@ warmup_lr: 1e-5
 opt: lamb
 smoothing: 0.1
 workers: 8
+
